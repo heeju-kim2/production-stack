@@ -5,14 +5,16 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
-
+from datetime import datetime 
 import openai
 import pandas as pd
+import os
+from multiprocessing import Process, Queue
 
 from utils import AsyncLoopWrapper, init_logger
 
 logger = init_logger(__name__, logging.INFO)
-
+from monitor_power import monitor_gpu_power_usage, monitor_npu_power_usage, calculate_avg_power_usage
 
 @dataclass
 class WorkloadConfig:
@@ -156,6 +158,7 @@ class RequestExecutor:
             generation_tokens=tokens_out,
             launch_time=start_time,
             finish_time=time.time(),
+            
         )
 
     def launch_request(
@@ -287,7 +290,7 @@ class UserSession:
         assert len(self.chat_history) == 0, (
             "Internal state should be set " "before the first request"
         )
-
+        
         num_passed_questions = int(offset / self.user_config.gap_between_requests) + 1
 
         passed_time = (num_passed_questions - 1) * self.user_config.gap_between_requests
@@ -335,6 +338,7 @@ class UserSession:
         df["question_id"] = range(1, len(self.prompt_lengths) + 1)
         df["launch_time"] = self.launch_times
         df["finish_time"] = self.finish_times
+
         return df
 
 
@@ -351,6 +355,7 @@ class UserSessionManager:
             workload_config.num_rounds - 1
         )
         self.gap_between_users = session_alive_time / (workload_config.num_users + 0)
+        #self.gap_between_users = session_alive_time  
         self.ramp_up_time = workload_config.num_users * self.gap_between_users
 
         logger.info(
@@ -598,9 +603,9 @@ def parse_arguments() -> WorkloadConfig:
         help="The time to run the simulation in seconds",
     )
     parser.add_argument(
-        "--output",
+        "--output_dir",
         type=str,
-        default="summary.csv",
+        default="result_dir",
         help="The output file name (ended with csv or txt) "
         "for the summary csv and txt",
     )
@@ -615,7 +620,7 @@ def parse_arguments() -> WorkloadConfig:
     parser.add_argument(
         "--log-interval",
         type=int,
-        default=30,
+        default=30, # must be same with power monitoring interval
         help="The time between two summary loggings in seconds",
     )
 
@@ -625,6 +630,7 @@ def parse_arguments() -> WorkloadConfig:
     parser.add_argument(
         "--sharegpt", action="store_true", help="Whether to use ShareGPT dataset"
     )
+
     args = parser.parse_args()
     return args
 
@@ -655,6 +661,20 @@ def main():
         return
 
     args = parse_arguments()
+
+    ## power monitoring 
+    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    power_monitor_dir = f"{args.output_dir}_power"
+    if not os.path.exists(power_monitor_dir):
+        os.makedirs(power_monitor_dir)
+    power_monitor_file = f"{power_monitor_dir}/device_status-{args.qps}.csv"
+
+    stop_queue = Queue()
+    monitor_process = Process(
+        target=monitor_npu_power_usage,
+        args=(power_monitor_file, stop_queue)
+    )
+    
     if args.verbose:
         global logger
         logger = init_logger(__name__, log_level=logging.DEBUG)
@@ -681,31 +701,39 @@ def main():
         workload_config, init_user_id=args.init_user_id, use_sharegpt=args.sharegpt
     )
 
-    num_steps = 0
-    start_time = time.time()
-    last_summary_time = start_time
+    monitor_process.start()
     try:
-        while True:
-            num_steps += 1
-            manager.step(time.time(), executor)
-            time.sleep(step_interval)
+        num_steps = 0
+        start_time = time.time()
+        last_summary_time = start_time
+        try:
+            while True:
+                num_steps += 1
+                manager.step(time.time(), executor)
+                time.sleep(step_interval)
 
-            if time.time() - last_summary_time > args.log_interval:
-                manager.summary(last_summary_time, time.time())
-                last_summary_time = time.time()
+                if time.time() - last_summary_time > args.log_interval:
+                    manager.summary(last_summary_time, time.time())
+                    last_summary_time = time.time()
 
-            if args.time is not None and time.time() - start_time > args.time:
-                break
+                if args.time is not None and time.time() - start_time > args.time:
+                    break
 
-    except KeyboardInterrupt:
-        logger.info("Interrupted, waiting for the final result")
+        except KeyboardInterrupt:
+            logger.info("Interrupted, waiting for the final result")
 
-    AsyncLoopWrapper.StopLoop()
+        AsyncLoopWrapper.StopLoop()
 
-    logger.info(f"Finished benchmarking, dumping summary to {args.output}")
+    finally:
+        stop_queue.put("stop")
+        monitor_process.join()
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    output_file = f"{args.output_dir}/output_{args.qps}.csv"
+    logger.info(f"Finished benchmarking, dumping summary to {output_file}")
     summary = manager.summary(0, time.time())
-    summary.to_csv(args.output, index=False)
-
+    summary.to_csv(output_file, index=False)
 
 if __name__ == "__main__":
     main()
