@@ -671,7 +671,7 @@ def main():
 
     stop_queue = Queue()
     monitor_process = Process(
-        target=monitor_npu_power_usage,
+        target=monitor_gpu_power_usage,
         args=(power_monitor_file, stop_queue)
     )
     
